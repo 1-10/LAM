@@ -126,13 +126,22 @@ def build_flame_params_json(flame_param_dir, output_path):
 def main():
     args = parse_args()
 
+    # ``FlameTrackingSingleImage`` falls back to parsing ``sys.argv`` itself
+    # when ``args`` is not provided, which would clash with this script's own
+    # CLI arguments (--video_path, --fps, --max_frames, ...). Build the
+    # ``Namespace`` it expects explicitly instead of relying on that fallback.
+    alignment_args = argparse.Namespace(output_dir=args.output_dir,
+                                        config_name='alignment',
+                                        blender_path=None)
+
     flametracking = FlameTrackingSingleImage(
         output_dir=args.output_dir,
         alignment_model_path=args.alignment_model_path,
         vgghead_model_path=args.vgghead_model_path,
         human_matting_path=args.human_matting_path,
         facebox_model_path=args.facebox_model_path,
-        detect_iris_landmarks=False)
+        detect_iris_landmarks=False,
+        args=alignment_args)
 
     return_code = flametracking.preprocess_video(args.video_path,
                                                  fps=args.fps,
