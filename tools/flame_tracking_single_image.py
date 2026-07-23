@@ -193,7 +193,9 @@ class FlameTrackingSingleImage:
             face_landmarks = self.alignment.analyze(saved_image, scale,
                                                     center_w, center_h)
 
-        # Normalize landmarks
+        # Normalize landmarks. The 3rd column is left as a placeholder
+        # (overwritten downstream by VideoDataset as a per-point confidence
+        # flag; see vhap/data/video_dataset.py).
         normalized_landmarks = np.zeros((face_landmarks.shape[0], 3))
         normalized_landmarks[:, :2] = face_landmarks / 1024
 
@@ -288,7 +290,10 @@ class FlameTrackingSingleImage:
         source_fps = video_capture.get(cv2.CAP_PROP_FPS) or 0
         if not source_fps or source_fps <= 0:
             source_fps = fps if fps else 25.0
-        frame_step = max(round(source_fps / fps), 1) if fps else 1
+        if fps:
+            frame_step = max(round(source_fps / fps), 1)
+        else:
+            frame_step = 1
 
         sequence_name = os.path.splitext(
             os.path.basename(input_video_path))[0]
