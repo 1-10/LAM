@@ -17,6 +17,9 @@ import cv2
 import sys
 import base64
 import subprocess
+import datetime
+import shutil
+import shutil
 
 import gradio as gr
 import numpy as np
@@ -43,7 +46,7 @@ from pathlib import Path
 
 torch._dynamo.config.suppress_errors = True  # 禁用动态编译错误
 torch._dynamo.config.disable = True
-h5_rendering = False  # True
+h5_rendering = True  # True
 
 
 def launch_env_not_compile_with_cuda():
@@ -210,12 +213,12 @@ def create_zip_archive(output_zip='runtime_/h5_render_data.zip', base_vid="nice"
 def demo_lam(flametracking, lam, cfg):
 
     # @spaces.GPU(duration=80)
-    def core_fn(image_path: str, video_params, working_dir, enable_oac_file):
+    def core_fn(image_path: str, video_params, working_dir, enable_oac_file, use_input_as_motion):
         image_raw = os.path.join(working_dir.name, "raw.png")
         with Image.open(image_path).convert('RGB') as img:
             img.save(image_raw)
-        
-        base_vid = os.path.basename(video_params).split(".")[0]
+
+        base_vid = os.path.basename(video_params).split(".")[0] if video_params else "input"
         flame_params_dir = os.path.join("./assets/sample_motion/export", base_vid, "flame_param")
         base_iid = os.path.basename(image_path).split('.')[0]
         image_path = os.path.join("./assets/sample_input", base_iid, "images/00000_00.png")
@@ -233,12 +236,10 @@ def demo_lam(flametracking, lam, cfg):
         )
         print("subdir_path and uid:", subdir_path, uid)
 
-        motion_seqs_dir = flame_params_dir
-
         dump_image_dir = os.path.dirname(dump_image_path)
         os.makedirs(dump_image_dir, exist_ok=True)
 
-        print(image_raw, motion_seqs_dir, dump_image_dir, dump_video_path)
+        print(image_raw, dump_image_dir, dump_video_path)
 
         dump_tmp_dir = dump_image_dir
 
@@ -256,6 +257,11 @@ def demo_lam(flametracking, lam, cfg):
         return_code, output_dir = flametracking.export()
         assert (return_code == 0), "flametracking export failed!"
 
+        if use_input_as_motion:
+            motion_seqs_dir = os.path.join(output_dir, "flame_param")
+        else:
+            motion_seqs_dir = flame_params_dir
+
         image_path = os.path.join(output_dir, "images/00000_00.png")
         mask_path = os.path.join(output_dir, "fg_masks/00000_00.png")
         print("image_path:", image_path, "\n"+"mask_path:", mask_path)
@@ -265,7 +271,7 @@ def demo_lam(flametracking, lam, cfg):
         render_size = cfg.render_size
         render_fps = 30
         # prepare reference image
-        image, _, _, shape_param = preprocess_image(image_path, mask_path=mask_path, intr=None, pad_ratio=0, bg_color=1., 
+        image, _, _, shape_param = preprocess_image(image_path, mask_path=mask_path, intr=None, pad_ratio=0, bg_color=1.,
                                              max_tgt_size=None, aspect_standard=aspect_standard, enlarge_ratio=[1.0, 1.0],
                                              render_tgt_size=source_size, multiply=14, need_mask=True, get_shape_param=True)
 
@@ -301,6 +307,11 @@ def demo_lam(flametracking, lam, cfg):
             h5_fd = "./runtime_data"
             lam.renderer.flame_model.save_h5_info(shape_param.unsqueeze(0).cuda(), fd=h5_fd)
             res['cano_gs_lst'][0].save_ply(os.path.join(h5_fd, "offset.ply"), rgb2sh=False, offset2xyz=True)
+            res['cano_gs_lst'][0].save_ply(os.path.join(h5_fd, "cano_gs.ply"), rgb2sh=True, offset2xyz=False)
+            ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            archive_dir = os.path.join(h5_fd, "archive")
+            os.makedirs(archive_dir, exist_ok=True)
+            shutil.copy(os.path.join(h5_fd, "cano_gs.ply"), os.path.join(archive_dir, f"cano_gs_{ts}.ply"))
             cmd = "thirdparties/blender/blender --background --python 'tools/generateGLBWithBlender_v2.py'"
             os.system(cmd)
             create_zip_archive(output_zip='runtime_data/h5_render_data.zip', base_vid=base_vid)
@@ -308,8 +319,6 @@ def demo_lam(flametracking, lam, cfg):
         if enable_oac_file:
             try:
                 from tools.generateARKITGLBWithBlender import generate_glb
-                from pathlib import Path
-                import shutil
                 import patoolib
 
                 oac_dir = os.path.join('./output/open_avatar_chat', base_iid)
@@ -362,9 +371,12 @@ def demo_lam(flametracking, lam, cfg):
         os.makedirs(os.path.dirname(dump_video_path), exist_ok=True)
 
         save_images2video(rgb, dump_video_path, render_fps)
-        audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
-        dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
-        add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
+        if use_input_as_motion:
+            dump_video_path_wa = dump_video_path
+        else:
+            audio_path = os.path.join("./assets/sample_motion/export", base_vid, base_vid+".wav")
+            dump_video_path_wa = dump_video_path.replace(".mp4", "_audio.mp4")
+            add_audio_to_video(dump_video_path, dump_video_path_wa, audio_path)
 
         return dump_image_path, dump_video_path_wa, output_zip_path if enable_oac_file else ''
 
@@ -423,7 +435,7 @@ def demo_lam(flametracking, lam, cfg):
                             video_input = gr.Video(label='Input Video',
                                                    height=480,
                                                    width=270,
-                                                   interactive=False)
+                                                   interactive=True)
 
                 examples = glob("./assets/sample_motion/export/*/*.mp4")
                 gr.Examples(
@@ -457,6 +469,8 @@ def demo_lam(flametracking, lam, cfg):
         # SETTING
         with gr.Row():
             with gr.Column(variant='panel', scale=1):
+                use_input_as_motion = gr.Checkbox(label="Use input image as motion (static pose / quality check)",
+                                                  value=False)
                 enable_oac_file = gr.Checkbox(label="Export ZIP file for Chatting Avatar",
                                               value=False,
                                               visible=os.path.exists(cfg.blender_path))
@@ -470,14 +484,8 @@ def demo_lam(flametracking, lam, cfg):
                     visible=os.path.exists(cfg.blender_path)
                 )
 
-        if h5_rendering:
-            gr.set_static_paths("runtime_data/")
-            assetPrefix = 'gradio_api/file=runtime_data/'
-            with gr.Row():
-                gs = gaussian_render(width = 300, height = 400, assets = assetPrefix + 'h5_render_data.zip')
-            with gr.Row():
-                renderButton = gr.Button('H5 Rendering')
-                renderButton.click(doRender, js='''() => window.start()''')
+        if False:  # h5_rendering UI disabled (set_static_paths not available in gradio 3.x)
+            pass
 
         working_dir = gr.State()
         submit.click(
@@ -491,7 +499,7 @@ def demo_lam(flametracking, lam, cfg):
         ).success(
             fn=core_fn,
             inputs=[input_image, video_input,
-                    working_dir, enable_oac_file],  # video_params refer to smpl dir
+                    working_dir, enable_oac_file, use_input_as_motion],  # video_params refer to smpl dir
             outputs=[processed_image, output_video, output_zip_textbox],
         )
 

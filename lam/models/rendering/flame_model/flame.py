@@ -26,7 +26,6 @@ import torch
 import trimesh
 import torch.nn as nn
 import numpy as np
-from tqdm import tqdm
 import pickle
 from collections import defaultdict
 try:
@@ -775,18 +774,24 @@ class FlameHeadSubdivided(FlameHead):
 
         mesh = trimesh.Trimesh(vertices=v_shaped.squeeze(0).cpu().numpy(), faces=faces)
         mesh.export(os.path.join(fd, "nature.obj"))
-        
-        bs_fd = os.path.join(fd, "bs")
-        if not os.path.exists(bs_fd):
-            os.system(f"mkdir -p {bs_fd}")
-        for i in tqdm(range(100), desc="Saving_100_expr_mesh"):
-            expr = torch.zeros((1, 100)).to(v_shaped.device)
-            expr[:, i] = 1.
-            v_shaped_expr = v_shaped + blend_shapes(expr, self.shapedirs_up[:, :, self.n_shape_params:])
-            v_shaped_expr = v_shaped_expr.cpu().numpy().squeeze(0)
 
-            mesh = trimesh.Trimesh(vertices=v_shaped_expr, faces=faces)
-            mesh.export(os.path.join(bs_fd, f"expr{i}.obj"))
+        self.save_expr_basis(os.path.join(fd, "expr_basis_20k.bytes"))
+
+    def save_expr_basis(self, path):
+        """Export the FLAME expr blend-shape basis for GaussianSplatLBSDeformer (Unity).
+
+        animation_forward applies expr as v_cano + blend_shapes(expr, shapedirs_up[:, :, n_shape_params:]),
+        and blend_shapes is linear (einsum('bl,mkl->bmk', betas, shape_disps)), so the per-dimension basis
+        vectors are just shapedirs_up's expr columns, independent of shape_params. One export covers every
+        avatar; no per-person regeneration needed.
+
+        Binary layout: splatCount * exprDim * 3 IEEE-754 float32, one float3 per splat per expression
+        dimension, row-major. Matches GaussianSplatLBSDeformer's m_ExprBasis format, and vertex order
+        matches lbs_weight_20k.json (both derived from the same upsampled FLAME mesh).
+        """
+        expr_basis = self.shapedirs_up[:, :, self.n_shape_params:self.n_shape_params + self.n_expr_params]
+        expr_basis = expr_basis.permute(0, 2, 1).contiguous().cpu().numpy().astype(np.float32)
+        expr_basis.tofile(path)
 
     def save_shaped_mesh(self, shape_params, fd="./runtime_data/"):
         if not os.path.exists(fd):

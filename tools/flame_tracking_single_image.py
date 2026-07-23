@@ -202,7 +202,11 @@ class FlameTrackingSingleImage:
             (np.ones_like(saved_image) * 255).astype(np.uint8))
 
         # Landmark detection
-        detections, _ = self.detector.detect(saved_image, 0.8, 1)
+        detections, _ = self.detector.detect(saved_image, 0.5, 1)
+        if len(detections) == 0:
+            logger.error('Failed to detect landmarks')
+            return ERROR_CODE['FailedToDetect']
+
         for idx, detection in enumerate(detections):
             x1_ori, y1_ori = detection[2], detection[3]
             x2_ori, y2_ori = x1_ori + detection[4], y1_ori + detection[5]
