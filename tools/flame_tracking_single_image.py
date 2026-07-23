@@ -134,31 +134,26 @@ class FlameTrackingSingleImage:
                             help='Blender path')
         return parser.parse_args()
 
-    def preprocess(self, input_image_path):
-        """Preprocess the input image for tracking."""
-        if not os.path.exists(input_image_path):
-            logger.warning(f'{input_image_path} does not exist!')
-            return ERROR_CODE['FailedToDetect']
+    def _process_frame(self, frame, frame_index):
+        """Runs bbox detection, matting and landmark detection for a single
+        frame (as a CHW uint8 tensor).
 
-        start_time = time.time()
-        logger.info('Starting Preprocessing...')
-        name_list = []
-        frame_index = 0
-
+        Returns a tuple ``(error_code, saved_image, mask, normalized_landmarks)``.
+        ``error_code`` is 0 on success, or one of ``ERROR_CODE`` on failure, in
+        which case the remaining values are ``None``.
+        """
         # Bounding box detection
-        frame = torchvision.io.read_image(input_image_path)[:3, ...]
         try:
             _, frame_bbox, _ = self.vgghead_encoder(frame, frame_index)
         except Exception:
             logger.error('Failed to detect face')
-            return ERROR_CODE['FailedToDetect']
+            return ERROR_CODE['FailedToDetect'], None, None, None
 
         if frame_bbox is None:
             logger.error('Failed to detect face')
-            return ERROR_CODE['FailedToDetect']
+            return ERROR_CODE['FailedToDetect'], None, None, None
 
         # Expand bounding box
-        name_list.append('00000.png')
         frame_bbox = expand_bbox(frame_bbox, scale=1.65).long()
 
         # Crop and resize
@@ -178,6 +173,48 @@ class FlameTrackingSingleImage:
         cropped_frame = cropped_frame.cpu() * 255.0
         saved_image = np.round(cropped_frame.cpu().permute(
             1, 2, 0).numpy()).astype(np.uint8)[:, :, (2, 1, 0)]
+
+        # Landmark detection
+        detections, _ = self.detector.detect(saved_image, 0.5, 1)
+        if len(detections) == 0:
+            logger.error('Failed to detect landmarks')
+            return ERROR_CODE['FailedToDetect'], None, None, None
+
+        face_landmarks = None
+        for idx, detection in enumerate(detections):
+            x1_ori, y1_ori = detection[2], detection[3]
+            x2_ori, y2_ori = x1_ori + detection[4], y1_ori + detection[5]
+
+            scale = max(x2_ori - x1_ori, y2_ori - y1_ori) / 180
+            center_w, center_h = (x1_ori + x2_ori) / 2, (y1_ori + y2_ori) / 2
+            scale, center_w, center_h = float(scale), float(center_w), float(
+                center_h)
+
+            face_landmarks = self.alignment.analyze(saved_image, scale,
+                                                    center_w, center_h)
+
+        # Normalize landmarks
+        normalized_landmarks = np.zeros((face_landmarks.shape[0], 3))
+        normalized_landmarks[:, :2] = face_landmarks / 1024
+
+        return 0, saved_image, mask, normalized_landmarks
+
+    def preprocess(self, input_image_path):
+        """Preprocess the input image for tracking."""
+        if not os.path.exists(input_image_path):
+            logger.warning(f'{input_image_path} does not exist!')
+            return ERROR_CODE['FailedToDetect']
+
+        start_time = time.time()
+        logger.info('Starting Preprocessing...')
+        name_list = ['00000.png']
+        frame_index = 0
+
+        frame = torchvision.io.read_image(input_image_path)[:3, ...]
+        error_code, saved_image, mask, normalized_landmarks = \
+            self._process_frame(frame, frame_index)
+        if error_code != 0:
+            return error_code
 
         # Create output directories if not exist
         self.sub_output_dir = os.path.join(
@@ -201,28 +238,7 @@ class FlameTrackingSingleImage:
                          name_list[frame_index]).replace('.png', '.jpg'),
             (np.ones_like(saved_image) * 255).astype(np.uint8))
 
-        # Landmark detection
-        detections, _ = self.detector.detect(saved_image, 0.5, 1)
-        if len(detections) == 0:
-            logger.error('Failed to detect landmarks')
-            return ERROR_CODE['FailedToDetect']
-
-        for idx, detection in enumerate(detections):
-            x1_ori, y1_ori = detection[2], detection[3]
-            x2_ori, y2_ori = x1_ori + detection[4], y1_ori + detection[5]
-
-            scale = max(x2_ori - x1_ori, y2_ori - y1_ori) / 180
-            center_w, center_h = (x1_ori + x2_ori) / 2, (y1_ori + y2_ori) / 2
-            scale, center_w, center_h = float(scale), float(center_w), float(
-                center_h)
-
-            face_landmarks = self.alignment.analyze(saved_image, scale,
-                                                    center_w, center_h)
-
-        # Normalize and save landmarks
-        normalized_landmarks = np.zeros((face_landmarks.shape[0], 3))
-        normalized_landmarks[:, :2] = face_landmarks / 1024
-
+        # Save landmarks
         landmark_output_dir = os.path.join(self.sub_output_dir, 'landmark2d')
         os.makedirs(landmark_output_dir, exist_ok=True)
 
@@ -242,6 +258,127 @@ class FlameTrackingSingleImage:
         torch.cuda.empty_cache()
         logger.info(
             f'Finished Processing Image. Time: {end_time - start_time:.2f}s')
+
+        return 0
+
+    def preprocess_video(self, input_video_path, fps=None, max_frames=None):
+        """Preprocess an input video for tracking.
+
+        Extracts frames from ``input_video_path`` (optionally re-sampled to
+        ``fps``, capped to ``max_frames``), then runs the same per-frame
+        bbox detection, matting and landmark detection as :meth:`preprocess`
+        on every extracted frame. Frames for which the face cannot be
+        detected are skipped so that ``images/``, ``alpha_maps/`` and the
+        aggregated ``landmark2d/landmarks.npz`` stay aligned. The resulting
+        layout matches what :class:`vhap.data.video_dataset.VideoDataset`
+        expects for a sequence.
+        """
+        if not os.path.exists(input_video_path):
+            logger.warning(f'{input_video_path} does not exist!')
+            return ERROR_CODE['FailedToDetect']
+
+        start_time = time.time()
+        logger.info('Starting Video Preprocessing...')
+
+        video_capture = cv2.VideoCapture(input_video_path)
+        if not video_capture.isOpened():
+            logger.error(f'Failed to open video {input_video_path}')
+            return ERROR_CODE['FailedToDetect']
+
+        source_fps = video_capture.get(cv2.CAP_PROP_FPS) or 0
+        if not source_fps or source_fps <= 0:
+            source_fps = fps if fps else 25.0
+        frame_step = max(round(source_fps / fps), 1) if fps else 1
+
+        sequence_name = os.path.splitext(
+            os.path.basename(input_video_path))[0]
+        self.sub_output_dir = os.path.join(self.output_preprocess,
+                                           sequence_name)
+        output_image_dir = os.path.join(self.sub_output_dir, 'images')
+        output_mask_dir = os.path.join(self.sub_output_dir, 'mask')
+        output_alpha_map_dir = os.path.join(self.sub_output_dir, 'alpha_maps')
+        landmark_output_dir = os.path.join(self.sub_output_dir, 'landmark2d')
+
+        os.makedirs(output_image_dir, exist_ok=True)
+        os.makedirs(output_mask_dir, exist_ok=True)
+        os.makedirs(output_alpha_map_dir, exist_ok=True)
+        os.makedirs(landmark_output_dir, exist_ok=True)
+
+        all_landmarks = []
+        iris_landmark_data = {}
+        source_frame_index = 0
+        saved_frame_index = 0
+
+        while max_frames is None or saved_frame_index < max_frames:
+            success, bgr_frame = video_capture.read()
+            if not success:
+                break
+
+            if source_frame_index % frame_step != 0:
+                source_frame_index += 1
+                continue
+            source_frame_index += 1
+
+            # cv2 reads frames as HWC BGR; convert to CHW RGB for the models.
+            rgb_frame = bgr_frame[:, :, ::-1]
+            frame = torch.from_numpy(
+                np.ascontiguousarray(rgb_frame)).permute(2, 0, 1)
+
+            error_code, saved_image, mask, normalized_landmarks = \
+                self._process_frame(frame, saved_frame_index)
+            if error_code != 0:
+                logger.warning(
+                    f'Skipping frame {source_frame_index - 1}: face not detected')
+                continue
+
+            frame_name = f'{saved_frame_index:05d}.png'
+
+            cv2.imwrite(os.path.join(output_image_dir, frame_name),
+                        saved_image)
+            cv2.imwrite(os.path.join(output_mask_dir, frame_name),
+                        np.array((mask.cpu() * 255.0)).astype(np.uint8))
+            cv2.imwrite(
+                os.path.join(output_alpha_map_dir, frame_name).replace(
+                    '.png', '.jpg'),
+                (np.ones_like(saved_image) * 255).astype(np.uint8))
+
+            all_landmarks.append(normalized_landmarks)
+
+            if self.detect_iris_landmarks_flag:
+                iris_landmarks = self._get_iris_landmarks(
+                    os.path.join(output_image_dir, frame_name))
+                iris_landmark_data[frame_name] = iris_landmarks
+
+            saved_frame_index += 1
+
+        video_capture.release()
+
+        if saved_frame_index == 0:
+            logger.error('Failed to detect any face in the input video')
+            return ERROR_CODE['FailedToDetect']
+
+        landmark_data = {
+            'bounding_box': [],
+            'face_landmark_2d': np.stack(all_landmarks, axis=0),
+        }
+        landmark_path = os.path.join(landmark_output_dir, 'landmarks.npz')
+        np.savez(landmark_path, **landmark_data)
+
+        if self.detect_iris_landmarks_flag:
+            if all(iris_landmark_data.values()):
+                json.dump(
+                    iris_landmark_data,
+                    open(os.path.join(landmark_output_dir, 'iris.json'), 'w'))
+            else:
+                logger.warning(
+                    'Skipping iris.json: iris landmarks missing for some '
+                    'frames.')
+
+        end_time = time.time()
+        torch.cuda.empty_cache()
+        logger.info(
+            f'Finished Video Preprocessing. {saved_frame_index} frames '
+            f'saved. Time: {end_time - start_time:.2f}s')
 
         return 0
 
@@ -275,8 +412,10 @@ class FlameTrackingSingleImage:
 
         return 0
 
-    def _detect_iris_landmarks(self, image_path):
-        """Detect iris landmarks in the given image."""
+    def _get_iris_landmarks(self, image_path):
+        """Detect iris landmarks in the given image, returning a flat list
+        of ``[x0, y0, x1, y1]`` scaled to 1024, or an empty list if no iris
+        landmarks could be detected."""
         from fdlite import face_detection_to_roi, iris_roi_from_face_landmarks
 
         img = Image.open(image_path)
@@ -285,45 +424,54 @@ class FlameTrackingSingleImage:
         face_detections = self.iris_detect_faces(img)
         if len(face_detections) != 1:
             logger.warning('Empty iris landmarks')
-        else:
-            face_detection = face_detections[0]
+            return []
+
+        face_detection = face_detections[0]
+        try:
+            face_roi = face_detection_to_roi(face_detection, img_size)
+        except ValueError:
+            logger.warning('Empty iris landmarks')
+            return []
+
+        face_landmarks = self.iris_detect_face_landmarks(img, face_roi)
+        if len(face_landmarks) == 0:
+            logger.warning('Empty iris landmarks')
+            return []
+
+        iris_rois = iris_roi_from_face_landmarks(face_landmarks, img_size)
+
+        if len(iris_rois) != 2:
+            logger.warning('Empty iris landmarks')
+            return []
+
+        landmarks = []
+        for iris_roi in iris_rois[::-1]:
             try:
-                face_roi = face_detection_to_roi(face_detection, img_size)
-            except ValueError:
-                logger.warning('Empty iris landmarks')
-                return
+                iris_landmarks = self.iris_detect_iris_landmarks(
+                    img, iris_roi).iris[0:1]
+            except np.linalg.LinAlgError:
+                logger.warning('Failed to get iris landmarks')
+                break
 
-            face_landmarks = self.iris_detect_face_landmarks(img, face_roi)
-            if len(face_landmarks) == 0:
-                logger.warning('Empty iris landmarks')
-                return
+            # For each landmark, append x and y coordinates scaled to 1024.
+            for landmark in iris_landmarks:
+                landmarks.append(landmark.x * 1024)
+                landmarks.append(landmark.y * 1024)
 
-            iris_rois = iris_roi_from_face_landmarks(face_landmarks, img_size)
+        return landmarks
 
-            if len(iris_rois) != 2:
-                logger.warning('Empty iris landmarks')
-                return
-
-            landmarks = []
-            for iris_roi in iris_rois[::-1]:
-                try:
-                    iris_landmarks = self.iris_detect_iris_landmarks(
-                        img, iris_roi).iris[0:1]
-                except np.linalg.LinAlgError:
-                    logger.warning('Failed to get iris landmarks')
-                    break
-
-                # For each landmark, append x and y coordinates scaled to 1024.
-                for landmark in iris_landmarks:
-                    landmarks.append(landmark.x * 1024)
-                    landmarks.append(landmark.y * 1024)
-
-            landmark_data = {'00000.png': landmarks}
-            json.dump(
-                landmark_data,
-                open(
-                    os.path.join(self.sub_output_dir, 'landmark2d',
-                                 'iris.json'), 'w'))
+    def _detect_iris_landmarks(self, image_path):
+        """Detect iris landmarks in the given image and write them to
+        ``landmark2d/iris.json`` for a single-image sequence."""
+        landmarks = self._get_iris_landmarks(image_path)
+        if not landmarks:
+            return
+        landmark_data = {'00000.png': landmarks}
+        json.dump(
+            landmark_data,
+            open(
+                os.path.join(self.sub_output_dir, 'landmark2d',
+                             'iris.json'), 'w'))
 
     def export(self):
         """Export the tracking results to configured folder."""
