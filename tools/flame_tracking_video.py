@@ -96,8 +96,16 @@ def build_flame_params_json(flame_param_dir, output_path):
         if shape is None and 'shape' in frame_data:
             shape = frame_data['shape']
         for key in SEQUENCE_KEYS:
-            if key in frame_data:
-                flame_params[key].append(frame_data[key][0].tolist())
+            if key not in frame_data:
+                continue
+            value = frame_data[key][0].tolist()
+            if key == 'expr':
+                # Matches the {"expr0": ..., "expr1": ..., ...} per-frame
+                # dict shape produced by
+                # assets/sample_motion/export_expression_json.py, rather
+                # than a plain list of coefficients.
+                value = {f'expr{i}': v for i, v in enumerate(value)}
+            flame_params[key].append(value)
 
     flame_params_json = {
         key: value
