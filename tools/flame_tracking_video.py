@@ -110,8 +110,8 @@ def build_flame_params_json(flame_param_dir, output_path):
     with open(output_path, 'w') as f:
         json.dump(flame_params_json, f)
 
-    logger.info(f'Wrote {flame_params_json["num_frames"]} frames to '
-               f'{output_path}')
+    num_frames = flame_params_json['num_frames']
+    logger.info(f'Wrote {num_frames} frames to {output_path}')
     return output_path
 
 

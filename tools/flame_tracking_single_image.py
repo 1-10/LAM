@@ -287,7 +287,7 @@ class FlameTrackingSingleImage:
             logger.error(f'Failed to open video {input_video_path}')
             return ERROR_CODE['FailedToDetect']
 
-        source_fps = video_capture.get(cv2.CAP_PROP_FPS) or 0
+        source_fps = video_capture.get(cv2.CAP_PROP_FPS)
         if not source_fps or source_fps <= 0:
             source_fps = fps if fps else 25.0
         if fps:
@@ -370,7 +370,7 @@ class FlameTrackingSingleImage:
         np.savez(landmark_path, **landmark_data)
 
         if self.detect_iris_landmarks_flag:
-            if all(iris_landmark_data.values()):
+            if iris_landmark_data and all(iris_landmark_data.values()):
                 json.dump(
                     iris_landmark_data,
                     open(os.path.join(landmark_output_dir, 'iris.json'), 'w'))
